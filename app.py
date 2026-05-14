@@ -166,6 +166,10 @@ def engineer_rinse_features(df):
 
 # ── Tier assignment ────────────────────────────────────────────────────────
 def assign_tier(score):
+    """Assigns tier to employees. Employess can hold one of three statuses "VERIFIED", "REVIEW", or "GHOST FLAG"
+    @score: score given to employee viz model analysis
+    """
+
     if score >= 75:
         return "VERIFIED"
     elif score >= 50:
