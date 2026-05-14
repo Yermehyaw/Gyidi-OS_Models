@@ -100,6 +100,10 @@ ATTENDANCE_COLS = [
 
 # ── Column normalisation — exact match only (demo mode) ───────────────────
 async def normalise_columns(df, target_cols):
+    """Strip/Delete 'unknown' cols from the uploaded data
+    @df:
+    @target_cols: target no of cols to be left after deletion
+    """
     df.columns = df.columns.str.strip()
     return df
 
@@ -150,6 +154,7 @@ def normalise_salary(df):
 
 # ── Rinse feature engineering ──────────────────────────────────────────────
 def engineer_rinse_features(df):
+    """ """
     join_date_counts = df["days_tenure"].value_counts()
     df["same_day_joiners"] = df["days_tenure"].map(join_date_counts)
     df["salary_roundness"] = (df["monthly_salary"] % 10000 == 0).astype(int)
