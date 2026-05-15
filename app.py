@@ -1358,7 +1358,14 @@ async def score_payroll(df_raw: pd.DataFrame, import_id: str = "") -> dict:
             except Exception:
                 df_mapped[col] = pd.Categorical(df_mapped[col]).codes
 
-    # ── Step 8: Model inference ───────────────────────────────────────────────
+    # ── Step 8: Coerce any remaining object columns to numeric ──────────────
+    # Prevents XGBoost "DataFrame.dtypes for data must be int, float, bool or
+    # category" errors when label encoding produces object dtype.
+    for col in target_cols:
+        if col in df_mapped.columns and df_mapped[col].dtype == object:
+            df_mapped[col] = pd.to_numeric(df_mapped[col], errors="coerce").fillna(0)
+
+    # ── Step 9: Model inference ───────────────────────────────────────────────
     if has_attendance:
         features = df_mapped[FULL_FEATURE_COLUMNS].fillna(0)
         xgb_proba = xgb_full.predict_proba(features)[:, 1]
@@ -1423,7 +1430,7 @@ async def score_payroll(df_raw: pd.DataFrame, import_id: str = "") -> dict:
             }
         )
 
-    # ── Step 12: Summary ──────────────────────────────────────────────────────
+    # ── Step 13: Summary ──────────────────────────────────────────────────────
     verified_count = sum(
         1
         for r in employee_records
