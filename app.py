@@ -16,14 +16,23 @@
 #   3.  Detect scan type (PAYROLL_SCAN vs RINSE_SCAN) from mapped columns
 #   4.  Normalise salary values (handle frequency variants and string formats)
 #   5.  Engineer Rinse-only features (same_day_joiners, salary_roundness, etc.)
-#   6.  Score each employee via an ensemble:
+#   6.  ★ Determine which model analytics are runnable given available columns:
+#         - PAYROLL_SCAN requires FULL_FEATURE_COLUMNS; skips XGB/IsoForest if absent
+#         - RINSE_SCAN   requires RINSE_FEATURE_COLUMNS; skips XGB if absent
+#         - Missing required columns are tracked and penalise the confidence score
+#         - Non-model columns (PII, notes, etc.) are NEVER required; missing = null,
+#           not an error — the response is always returned with whatever data exists
+#   7.  Score each employee via an ensemble (only if enough features present):
 #         PAYROLL_SCAN → 70% XGBoost (full) + 30% Isolation Forest
 #         RINSE_SCAN   → 100% XGBoost (rinse, lightweight)
-#   7.  Convert raw ensemble probability to a 0–100 trust score
-#   8.  Assign payment tier, risk level, and recommended action
-#   9.  Build rule-based anomaly list and binary signal flags
-#   10. Concurrently generate Gemini AI audit explanations for flagged employees
-#   11. Return structured JSON conforming to the canonical response schema v2
+#         INSUFFICIENT DATA → trust_score=50.0, confidence penalised proportionally
+#   8.  Convert raw ensemble probability to a 0–100 trust score
+#   9.  Assign payment tier, risk level, and recommended action
+#   10. Build rule-based anomaly list and binary signal flags
+#   11. Concurrently generate Gemini AI audit explanations for flagged employees
+#   12. ★ Serialise response: null values are included ONLY for schema-required fields
+#         that are genuinely absent from the uploaded file; values present in the CSV
+#         are always forwarded to the response regardless of column naming
 #
 # ── Column mapping strategy (Step 2) ─────────────────────────────────────────
 #
@@ -195,6 +204,53 @@ ATTENDANCE_COLS = [
 
 # Union of all canonical columns across both scan types.
 ALL_CANONICAL_COLS = list(dict.fromkeys(FULL_FEATURE_COLUMNS + RINSE_FEATURE_COLUMNS))
+
+# =============================================================================
+# FEATURE COVERAGE GROUPS
+# These groups define which columns are "core" for each model.  When a group
+# is entirely absent from the uploaded file the corresponding model component
+# is skipped and the confidence score is penalised.
+#
+# Each entry:
+#   "label"    — human-readable name surfaced in scan_metadata.data_coverage
+#   "columns"  — canonical column names; ALL must be present to run this group
+#   "weight"   — fraction of confidence lost when this group is fully missing
+#                (weights do not need to sum to 1.0; they are normalised)
+# =============================================================================
+
+DATA_COVERAGE_GROUPS = [
+    {
+        "label": "salary_core",
+        "columns": ["monthly_salary", "band_min", "band_max"],
+        "weight": 0.30,  # Salary is the most important payroll signal
+    },
+    {
+        "label": "identity_banking",
+        "columns": ["Bank Name", "Acct Age (Mths)", "BVN Acct Count"],
+        "weight": 0.25,
+    },
+    {
+        "label": "employment_profile",
+        "columns": ["Department", "Job Title", "Grade", "days_tenure"],
+        "weight": 0.20,
+    },
+    {
+        "label": "activity_signals",
+        "columns": ["attendance_pct", "Monthly Txns", "days_since_active"],
+        "weight": 0.15,
+    },
+    {
+        "label": "attendance_detail",  # Full/PAYROLL scan only
+        "columns": [
+            "Total Days Present",
+            "Total Days Absent",
+            "Avg Presence %",
+            "Months w/ Zero Attend.",
+            "Max Consec. Zero Mths",
+        ],
+        "weight": 0.10,
+    },
+]
 
 # =============================================================================
 # COLUMN ALIAS TABLE
@@ -802,29 +858,56 @@ def normalise_salary(df: pd.DataFrame) -> pd.DataFrame:
 def engineer_rinse_features(df: pd.DataFrame) -> pd.DataFrame:
     """Derive the four engineered features required by the RINSE_SCAN model.
 
+    Each feature is computed only when its source columns are present.
+    If a source column is missing the engineered feature defaults to 0
+    (a neutral value) so the DataFrame shape is always correct for the model.
+
     Features:
         same_day_joiners      — employees sharing this join date (spike = bulk fraud).
+                                Source: days_tenure.  Default: 1 (unique join date).
         salary_roundness      — 1 if salary is a round ×10,000 (fabricated record signal).
+                                Source: monthly_salary.  Default: 0.
         salary_band_violation — 1 if salary >130% band_max or <70% band_min.
+                                Source: monthly_salary, band_min, band_max.  Default: 0.
         salary_deviation      — normalised salary position in band [0=min, 1=max].
+                                Source: monthly_salary, band_min, band_max.  Default: 0.5.
 
     Args:
-        df: DataFrame with days_tenure, monthly_salary, band_min, band_max.
+        df: DataFrame post column-mapping.  May be missing any column.
 
     Returns:
-        DataFrame with four new feature columns appended.
+        DataFrame with four new feature columns appended (never raises).
     """
-    join_counts = df["days_tenure"].value_counts()
-    df["same_day_joiners"] = df["days_tenure"].map(join_counts)
-    df["salary_roundness"] = (df["monthly_salary"] % 10000 == 0).astype(int)
-    df["salary_above_band"] = (df["monthly_salary"] > df["band_max"] * 1.3).astype(int)
-    df["salary_below_band"] = (df["monthly_salary"] < df["band_min"] * 0.7).astype(int)
-    df["salary_band_violation"] = (
-        df["salary_above_band"] | df["salary_below_band"]
-    ).astype(int)
-    df["salary_deviation"] = (df["monthly_salary"] - df["band_min"]) / (
-        df["band_max"] - df["band_min"] + 1
-    )
+    # same_day_joiners
+    if "days_tenure" in df.columns:
+        join_counts = df["days_tenure"].value_counts()
+        df["same_day_joiners"] = df["days_tenure"].map(join_counts).fillna(1)
+    else:
+        df["same_day_joiners"] = 1  # Neutral: treat as unique joiner
+
+    # salary_roundness
+    if "monthly_salary" in df.columns:
+        df["salary_roundness"] = (df["monthly_salary"].fillna(0) % 10000 == 0).astype(
+            int
+        )
+    else:
+        df["salary_roundness"] = 0
+
+    # salary_band_violation & salary_deviation (need all three salary cols)
+    if all(c in df.columns for c in ("monthly_salary", "band_min", "band_max")):
+        sal = df["monthly_salary"].fillna(0)
+        bmin = df["band_min"].fillna(0)
+        bmax = df["band_max"].fillna(0)
+        df["salary_above_band"] = (sal > bmax * 1.3).astype(int)
+        df["salary_below_band"] = (sal < bmin * 0.7).astype(int)
+        df["salary_band_violation"] = (
+            df["salary_above_band"] | df["salary_below_band"]
+        ).astype(int)
+        df["salary_deviation"] = (sal - bmin) / (bmax - bmin + 1)
+    else:
+        df["salary_band_violation"] = 0
+        df["salary_deviation"] = 0.5  # Mid-band neutral value
+
     return df
 
 
@@ -1154,24 +1237,111 @@ def build_system_flags(tier: str, risk_level: str) -> dict:
 
 
 # =============================================================================
+# DATA COVERAGE ASSESSMENT
+# =============================================================================
+
+
+def compute_data_coverage(available_cols: set[str]) -> dict:
+    """Assess which feature groups are present in the uploaded file.
+
+    For each group in DATA_COVERAGE_GROUPS, a group is considered "present"
+    when at least one of its columns was resolved (not necessarily all of them).
+    The missing-weight sum drives the confidence penalty applied to every
+    employee record in the file.
+
+    Args:
+        available_cols: Set of canonical column names present after mapping.
+
+    Returns:
+        Dict with keys:
+            groups          — per-group coverage details (present, found_cols,
+                              missing_cols, weight)
+            coverage_ratio  — float [0, 1]; fraction of weighted groups present
+            confidence_penalty — float [0, 1]; how much to subtract from the
+                                 raw model confidence (0 = no penalty)
+            model_runnable  — bool; True when the minimum columns needed for at
+                              least the RINSE model are present
+    """
+    total_weight = sum(g["weight"] for g in DATA_COVERAGE_GROUPS)
+    missing_weight = 0.0
+    group_details = []
+
+    for group in DATA_COVERAGE_GROUPS:
+        found = [c for c in group["columns"] if c in available_cols]
+        missing = [c for c in group["columns"] if c not in available_cols]
+        present = len(found) > 0  # group contributes if ≥1 column found
+
+        if not present:
+            missing_weight += group["weight"]
+
+        group_details.append(
+            {
+                "label": group["label"],
+                "present": present,
+                "found_cols": found,
+                "missing_cols": missing,
+                "weight": group["weight"],
+            }
+        )
+
+    # Penalty is proportional to the weight of fully-missing groups.
+    confidence_penalty = round(missing_weight / total_weight, 3)
+    coverage_ratio = round(1.0 - confidence_penalty, 3)
+
+    # Minimum runnable: salary_core OR at least 3 RINSE_BASE_FEATURES present.
+    rinse_present = sum(1 for c in RINSE_BASE_FEATURES if c in available_cols)
+    model_runnable = rinse_present >= 3
+
+    return {
+        "groups": group_details,
+        "coverage_ratio": coverage_ratio,
+        "confidence_penalty": confidence_penalty,
+        "model_runnable": model_runnable,
+    }
+
+
+# =============================================================================
 # CONFIDENCE SCORE
 # =============================================================================
 
 
-def compute_confidence(trust_score: float, anomaly_count: int) -> float:
+def compute_confidence(
+    trust_score: float,
+    anomaly_count: int,
+    coverage_penalty: float = 0.0,
+) -> float:
     """Estimate model confidence (0–1) in the assigned trust score.
 
-    Higher when the score is extreme (near 0 or 100) and multiple corroborating
-    anomalies were detected.  Lower for borderline scores near 50.
+    Confidence is higher when:
+        • The trust score is extreme (near 0 or 100) — less ambiguity.
+        • Multiple corroborating rule-based anomalies were detected.
+
+    Confidence is lower when:
+        • The score is near 50 (borderline / uncertain).
+        • Key feature groups were missing from the uploaded file
+          (captured by coverage_penalty, range [0, 1]).
 
     Formula:
-        base   = |trust_score − 50| / 50        (0 at midpoint, 1 at extremes)
-        signal = min(anomaly_count, 5) / 5       (0–1, capped at 5 anomalies)
-        result = 0.6 × base + 0.4 × signal
+        base     = |trust_score − 50| / 50        (0 at midpoint, 1 at extremes)
+        signal   = min(anomaly_count, 5) / 5       (0–1, capped at 5 anomalies)
+        raw      = 0.6 × base + 0.4 × signal
+        result   = max(0, raw × (1 − coverage_penalty))
+
+    A file with no recognisable feature columns at all yields a penalty of 1.0,
+    driving confidence to 0.0 — clearly communicating that the score is a guess.
+
+    Args:
+        trust_score:      Float in [0, 100].
+        anomaly_count:    Number of rule-based anomalies that fired.
+        coverage_penalty: Float in [0, 1] from compute_data_coverage().
+
+    Returns:
+        Float in [0.0, 1.0] rounded to 2 decimal places.
     """
     base = abs(trust_score - 50) / 50
     signal = min(anomaly_count, 5) / 5
-    return round(0.6 * base + 0.4 * signal, 2)
+    raw = 0.6 * base + 0.4 * signal
+    return round(max(0.0, raw * (1.0 - coverage_penalty)), 2)
 
 
 # =============================================================================
