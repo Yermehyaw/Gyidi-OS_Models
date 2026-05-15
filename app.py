@@ -808,43 +808,23 @@ def engineer_rinse_features(df: pd.DataFrame) -> pd.DataFrame:
         salary_band_violation — 1 if salary >130% band_max or <70% band_min.
         salary_deviation      — normalised salary position in band [0=min, 1=max].
 
-    If required base columns are missing from the DataFrame, the derived feature
-    is set to 0 (no anomaly signal).
-
     Args:
         df: DataFrame with days_tenure, monthly_salary, band_min, band_max.
 
     Returns:
         DataFrame with four new feature columns appended.
     """
-    if "days_tenure" in df.columns:
-        join_counts = df["days_tenure"].value_counts()
-        df["same_day_joiners"] = df["days_tenure"].map(join_counts)
-    else:
-        df["same_day_joiners"] = 0
-
-    if "monthly_salary" in df.columns:
-        df["salary_roundness"] = (df["monthly_salary"] % 10000 == 0).astype(int)
-    else:
-        df["salary_roundness"] = 0
-
-    has_band = (
-        "monthly_salary" in df.columns
-        and "band_min" in df.columns
-        and "band_max" in df.columns
+    join_counts = df["days_tenure"].value_counts()
+    df["same_day_joiners"] = df["days_tenure"].map(join_counts)
+    df["salary_roundness"] = (df["monthly_salary"] % 10000 == 0).astype(int)
+    df["salary_above_band"] = (df["monthly_salary"] > df["band_max"] * 1.3).astype(int)
+    df["salary_below_band"] = (df["monthly_salary"] < df["band_min"] * 0.7).astype(int)
+    df["salary_band_violation"] = (
+        df["salary_above_band"] | df["salary_below_band"]
+    ).astype(int)
+    df["salary_deviation"] = (df["monthly_salary"] - df["band_min"]) / (
+        df["band_max"] - df["band_min"] + 1
     )
-    if has_band:
-        df["salary_above_band"] = (df["monthly_salary"] > df["band_max"] * 1.3).astype(int)
-        df["salary_below_band"] = (df["monthly_salary"] < df["band_min"] * 0.7).astype(int)
-        df["salary_band_violation"] = (
-            df["salary_above_band"] | df["salary_below_band"]
-        ).astype(int)
-        df["salary_deviation"] = (df["monthly_salary"] - df["band_min"]) / (
-            df["band_max"] - df["band_min"] + 1
-        )
-    else:
-        df["salary_band_violation"] = 0
-        df["salary_deviation"] = 0.0
     return df
 
 
@@ -1061,56 +1041,34 @@ def get_top_signals(row: dict) -> list:
 # =============================================================================
 
 
-def extract_employee_profile(
-    row_raw: pd.Series,
-    employee_id: str,
-    row_mapped=None,
-) -> dict:
+def extract_employee_profile(row_raw: pd.Series, employee_id: str) -> dict:
     """Extract PII and HR profile fields from the original (pre-mapped) row.
 
-    Checks the mapped row (canonical column names) first, then the raw row
-    (original column names) as fallback.  This ensures fields are found
-    regardless of whether the column mapper renamed them.
-
-    Attempts multiple column name variants; defaults to None for absent
-    columns.  Gender is normalised to the enum.
+    Uses the raw row (before column renaming) so original PII column names
+    are still present.  Attempts multiple column name variants; defaults to
+    None for absent columns.  Gender is normalised to the enum.
 
     Args:
-        row_raw:     Single row from df_raw (original column names).
+        row_raw:     Single row from df_raw.
         employee_id: Resolved employee ID string.
-        row_mapped:  Optional single row from df_mapped (canonical names).
 
     Returns:
         Dict conforming to the "employee" sub-object in the response schema.
     """
     raw = row_raw.to_dict() if hasattr(row_raw, "to_dict") else {}
-    mapped = (
-        row_mapped.to_dict()
-        if row_mapped is not None and hasattr(row_mapped, "to_dict")
-        else {}
-    )
-
-    def _norm_key(k: str) -> str:
-        return str(k).lower().strip().replace("_", " ").replace("-", " ")
-
-    raw_lk = {_norm_key(k): v for k, v in raw.items()}
-    mapped_lk = {_norm_key(k): v for k, v in mapped.items()}
 
     def safe_get(keys: list, default=None):
         for k in keys:
-            nk = _norm_key(k)
-            v = mapped_lk.get(nk) or raw_lk.get(nk)
-            if v is not None and str(v).strip() not in ("", "nan", "NaT", "<NA>"):
+            v = raw.get(k)
+            if v is not None and str(v).strip() not in ("", "nan", "NaT"):
                 return str(v).strip()
         return default
 
     def safe_float(keys: list):
         for k in keys:
-            nk = _norm_key(k)
-            v = mapped_lk.get(nk) or raw_lk.get(nk)
             try:
-                f = float(v)
-                return f
+                f = float(raw[k])
+                return f if f != 0.0 else None
             except (KeyError, TypeError, ValueError):
                 continue
         return None
@@ -1148,8 +1106,8 @@ def extract_employee_profile(
         "position": safe_get(["Job Title", "Position", "Role", "Designation"]),
         "hire_date": safe_get(["Hire Date", "Start Date", "Date Joined", "hire_date"]),
         "termination_date": safe_get(["Termination Date", "Exit Date", "End Date"]),
-        "employment_type": EmploymentType.FULL_TIME,
-        "status": EmploymentStatus.ACTIVE,
+        "employment_type": EmploymentType.FULL_TIME,  # Defaulted; extend if column exists
+        "status": EmploymentStatus.ACTIVE,  # Defaulted; extend if column exists
         "base_salary": safe_float(["monthly_salary"]),
         "allowances": safe_float(["allowances", "Allowances"]),
         "deductions": safe_float(["deductions", "Deductions"]),
@@ -1361,15 +1319,14 @@ async def score_payroll(df_raw: pd.DataFrame, import_id: str = "") -> dict:
     # ── Step 4: Salary normalisation ─────────────────────────────────────────
     df_mapped = normalise_salary(df_mapped)
 
-    # ── Step 5: Impute missing base feature columns with 0 ───────────────────
-    # Must happen before engineer_rinse_features so base columns exist.
+    # ── Step 5: Rinse feature engineering ────────────────────────────────────
+    if not has_attendance:
+        df_mapped = engineer_rinse_features(df_mapped)
+
+    # ── Step 6: Impute missing columns with 0 ────────────────────────────────
     for col in target_cols:
         if col not in df_mapped.columns:
             df_mapped[col] = 0
-
-    # ── Step 6: Rinse feature engineering ────────────────────────────────────
-    if not has_attendance:
-        df_mapped = engineer_rinse_features(df_mapped)
 
     # ── Step 7: Label-encode categorical columns ──────────────────────────────
     for col in CATEGORICAL_COLS:
@@ -1380,14 +1337,7 @@ async def score_payroll(df_raw: pd.DataFrame, import_id: str = "") -> dict:
             except Exception:
                 df_mapped[col] = pd.Categorical(df_mapped[col]).codes
 
-    # ── Step 8: Coerce any remaining object columns to numeric ──────────────
-    # Prevents XGBoost "DataFrame.dtypes for data must be int, float, bool or
-    # category" errors when label encoding produces object dtype.
-    for col in target_cols:
-        if col in df_mapped.columns and df_mapped[col].dtype == object:
-            df_mapped[col] = pd.to_numeric(df_mapped[col], errors="coerce").fillna(0)
-
-    # ── Step 9: Model inference ───────────────────────────────────────────────
+    # ── Step 8: Model inference ───────────────────────────────────────────────
     if has_attendance:
         features = df_mapped[FULL_FEATURE_COLUMNS].fillna(0)
         xgb_proba = xgb_full.predict_proba(features)[:, 1]
@@ -1435,7 +1385,7 @@ async def score_payroll(df_raw: pd.DataFrame, import_id: str = "") -> dict:
 
         employee_records.append(
             {
-                "employee": extract_employee_profile(df_raw.iloc[i], str(eid), df_mapped.iloc[i]),
+                "employee": extract_employee_profile(df_raw.iloc[i], str(eid)),
                 "analysis": {
                     "trust_score": ts_f,
                     "payment_tier": tier,
@@ -1452,7 +1402,7 @@ async def score_payroll(df_raw: pd.DataFrame, import_id: str = "") -> dict:
             }
         )
 
-    # ── Step 13: Summary ──────────────────────────────────────────────────────
+    # ── Step 12: Summary ──────────────────────────────────────────────────────
     verified_count = sum(
         1
         for r in employee_records
