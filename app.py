@@ -1061,34 +1061,56 @@ def get_top_signals(row: dict) -> list:
 # =============================================================================
 
 
-def extract_employee_profile(row_raw: pd.Series, employee_id: str) -> dict:
+def extract_employee_profile(
+    row_raw: pd.Series,
+    employee_id: str,
+    row_mapped: pd.Series | None = None,
+) -> dict:
     """Extract PII and HR profile fields from the original (pre-mapped) row.
 
-    Uses the raw row (before column renaming) so original PII column names
-    are still present.  Attempts multiple column name variants; defaults to
-    None for absent columns.  Gender is normalised to the enum.
+    Checks the mapped row (canonical column names) first, then the raw row
+    (original column names) as fallback.  This ensures fields are found
+    regardless of whether the column mapper renamed them.
+
+    Attempts multiple column name variants; defaults to None for absent
+    columns.  Gender is normalised to the enum.
 
     Args:
-        row_raw:     Single row from df_raw.
+        row_raw:     Single row from df_raw (original column names).
         employee_id: Resolved employee ID string.
+        row_mapped:  Optional single row from df_mapped (canonical names).
 
     Returns:
         Dict conforming to the "employee" sub-object in the response schema.
     """
     raw = row_raw.to_dict() if hasattr(row_raw, "to_dict") else {}
+    mapped = (
+        row_mapped.to_dict()
+        if row_mapped is not None and hasattr(row_mapped, "to_dict")
+        else {}
+    )
+
+    def _norm_key(k: str) -> str:
+        return str(k).lower().strip().replace("_", " ").replace("-", " ")
+
+    raw_lk = {_norm_key(k): v for k, v in raw.items()}
+    mapped_lk = {_norm_key(k): v for k, v in mapped.items()}
 
     def safe_get(keys: list, default=None):
         for k in keys:
-            v = raw.get(k)
-            if v is not None and str(v).strip() not in ("", "nan", "NaT"):
+            nk = _norm_key(k)
+            v = mapped_lk.get(nk) or raw_lk.get(nk)
+            if v is not None and str(v).strip() not in ("", "nan", "NaT", "<NA>"):
                 return str(v).strip()
         return default
 
     def safe_float(keys: list):
         for k in keys:
+            nk = _norm_key(k)
+            v = mapped_lk.get(nk) or raw_lk.get(nk)
             try:
-                f = float(raw[k])
-                return f if f != 0.0 else None
+                f = float(v)
+                return f
             except (KeyError, TypeError, ValueError):
                 continue
         return None
@@ -1126,8 +1148,8 @@ def extract_employee_profile(row_raw: pd.Series, employee_id: str) -> dict:
         "position": safe_get(["Job Title", "Position", "Role", "Designation"]),
         "hire_date": safe_get(["Hire Date", "Start Date", "Date Joined", "hire_date"]),
         "termination_date": safe_get(["Termination Date", "Exit Date", "End Date"]),
-        "employment_type": EmploymentType.FULL_TIME,  # Defaulted; extend if column exists
-        "status": EmploymentStatus.ACTIVE,  # Defaulted; extend if column exists
+        "employment_type": EmploymentType.FULL_TIME,
+        "status": EmploymentStatus.ACTIVE,
         "base_salary": safe_float(["monthly_salary"]),
         "allowances": safe_float(["allowances", "Allowances"]),
         "deductions": safe_float(["deductions", "Deductions"]),
@@ -1413,7 +1435,7 @@ async def score_payroll(df_raw: pd.DataFrame, import_id: str = "") -> dict:
 
         employee_records.append(
             {
-                "employee": extract_employee_profile(df_raw.iloc[i], str(eid)),
+                "employee": extract_employee_profile(df_raw.iloc[i], str(eid), df_mapped.iloc[i]),
                 "analysis": {
                     "trust_score": ts_f,
                     "payment_tier": tier,
