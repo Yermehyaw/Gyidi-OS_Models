@@ -1064,7 +1064,7 @@ def get_top_signals(row: dict) -> list:
 def extract_employee_profile(
     row_raw: pd.Series,
     employee_id: str,
-    row_mapped: pd.Series | None = None,
+    row_mapped=None,
 ) -> dict:
     """Extract PII and HR profile fields from the original (pre-mapped) row.
 
