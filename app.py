@@ -808,23 +808,43 @@ def engineer_rinse_features(df: pd.DataFrame) -> pd.DataFrame:
         salary_band_violation — 1 if salary >130% band_max or <70% band_min.
         salary_deviation      — normalised salary position in band [0=min, 1=max].
 
+    If required base columns are missing from the DataFrame, the derived feature
+    is set to 0 (no anomaly signal).
+
     Args:
         df: DataFrame with days_tenure, monthly_salary, band_min, band_max.
 
     Returns:
         DataFrame with four new feature columns appended.
     """
-    join_counts = df["days_tenure"].value_counts()
-    df["same_day_joiners"] = df["days_tenure"].map(join_counts)
-    df["salary_roundness"] = (df["monthly_salary"] % 10000 == 0).astype(int)
-    df["salary_above_band"] = (df["monthly_salary"] > df["band_max"] * 1.3).astype(int)
-    df["salary_below_band"] = (df["monthly_salary"] < df["band_min"] * 0.7).astype(int)
-    df["salary_band_violation"] = (
-        df["salary_above_band"] | df["salary_below_band"]
-    ).astype(int)
-    df["salary_deviation"] = (df["monthly_salary"] - df["band_min"]) / (
-        df["band_max"] - df["band_min"] + 1
+    if "days_tenure" in df.columns:
+        join_counts = df["days_tenure"].value_counts()
+        df["same_day_joiners"] = df["days_tenure"].map(join_counts)
+    else:
+        df["same_day_joiners"] = 0
+
+    if "monthly_salary" in df.columns:
+        df["salary_roundness"] = (df["monthly_salary"] % 10000 == 0).astype(int)
+    else:
+        df["salary_roundness"] = 0
+
+    has_band = (
+        "monthly_salary" in df.columns
+        and "band_min" in df.columns
+        and "band_max" in df.columns
     )
+    if has_band:
+        df["salary_above_band"] = (df["monthly_salary"] > df["band_max"] * 1.3).astype(int)
+        df["salary_below_band"] = (df["monthly_salary"] < df["band_min"] * 0.7).astype(int)
+        df["salary_band_violation"] = (
+            df["salary_above_band"] | df["salary_below_band"]
+        ).astype(int)
+        df["salary_deviation"] = (df["monthly_salary"] - df["band_min"]) / (
+            df["band_max"] - df["band_min"] + 1
+        )
+    else:
+        df["salary_band_violation"] = 0
+        df["salary_deviation"] = 0.0
     return df
 
 
@@ -1319,14 +1339,15 @@ async def score_payroll(df_raw: pd.DataFrame, import_id: str = "") -> dict:
     # ── Step 4: Salary normalisation ─────────────────────────────────────────
     df_mapped = normalise_salary(df_mapped)
 
-    # ── Step 5: Rinse feature engineering ────────────────────────────────────
-    if not has_attendance:
-        df_mapped = engineer_rinse_features(df_mapped)
-
-    # ── Step 6: Impute missing columns with 0 ────────────────────────────────
+    # ── Step 5: Impute missing base feature columns with 0 ───────────────────
+    # Must happen before engineer_rinse_features so base columns exist.
     for col in target_cols:
         if col not in df_mapped.columns:
             df_mapped[col] = 0
+
+    # ── Step 6: Rinse feature engineering ────────────────────────────────────
+    if not has_attendance:
+        df_mapped = engineer_rinse_features(df_mapped)
 
     # ── Step 7: Label-encode categorical columns ──────────────────────────────
     for col in CATEGORICAL_COLS:
